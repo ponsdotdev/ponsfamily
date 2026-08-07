@@ -33,7 +33,8 @@ import {
     FeePolicySnapshot,
     GraduationPhase,
     IPonsV2FeeEscrow,
-    IPonsV2LaunchFactory
+    IPonsV2LaunchFactory,
+    SnipeTaxTerms
 } from "./interfaces/ILaunchpadV2.sol";
 
 /**
@@ -59,6 +60,16 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
     uint256 private constant MAX_CURVE_FEE_BPS = 1_000; // 10%
     uint256 private constant MAX_CREATOR_TAX_CEILING_BPS = 1_000; // 10%
     uint256 private constant MAX_TOTAL_TRADE_FEE_BPS = 2_000; // 20%
+    // Mirrors PonsV2BondingCurve. The curve enforces its own copy; these exist
+    // so a config that could never deploy is rejected at addLaunchConfig time
+    // rather than at the first launch that tries to use it.
+    uint256 private constant MAX_SNIPE_TAX_START_BPS = 9_900; // 99%
+    uint256 private constant MIN_BUYER_SHARE_BPS = 100; // 1%
+    uint256 private constant MAX_SNIPE_TAX_EXEMPTIONS = 32;
+    // The longest opening window a config may declare. Past a minute the
+    // mechanism stops being anti-latency and starts being a standing tax on
+    // anyone who did not have advance notice of the launch.
+    uint256 private constant MAX_SNIPE_TAX_WINDOW = 60;
     uint8 private constant MIN_PAIR_TOKEN_DECIMALS = 6;
     // Smallest supply a launch may declare, and the reference supply the
     // quotability check assumes when it runs before any config is known.
@@ -126,6 +137,9 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
         //   uint16  policy.buybackBurnBps
         //   uint16  policy.hookFeeBps
         //   uint16  policy.maxInternalPriceImpactBps
+        //   uint16  config.snipeTax.startBps
+        //   uint32  config.snipeTax.window
+        //   uint32  config.snipeTax.halfLife
         //
         // It spans every owner-controlled term that fixes what the creator is
         // buying, not the phantom reserve and threshold alone, so the supply,
@@ -147,6 +161,10 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
         uint24 poolFee;
         int24 tickSpacing;
         bool enabled;
+        // Opening-window buy tax applied by every curve deployed from this
+        // config. A zero startBps reproduces the pre-window behaviour exactly,
+        // so configs written before this field existed remain expressible.
+        SnipeTaxTerms snipeTax;
     }
 
     /**
@@ -217,9 +235,14 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
     error LaunchEconomicsMismatch(bytes32 expected, bytes32 actual);
     error InexactTransfer(address token, uint256 expected, uint256 received);
     error GraduationSeedNotViable();
+
+    error SnipeTaxTermsInvalid();
+    error ExemptionListTooLong();
+    error NotTrustedRouter();
     error SupplyTooHigh();
     error GraduationRescueTooEarly(uint256 availableAt);
 
+    event TrustedRouterUpdated(address indexed router, bool trusted);
     event TokenLaunched(
         address indexed token,
         address indexed curve,
@@ -285,6 +308,10 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
     bool public launchEnabled;
 
     mapping(address launcher => bool enabled) public whitelistedLaunchers;
+    // Contracts allowed to call launchTokenFor. A trusted router may attribute
+    // a launch to someone else, but never grants them launch eligibility: the
+    // named launcher still has to pass canLaunch on their own.
+    mapping(address router => bool trusted) public trustedRouters;
     mapping(address pairToken => bool approved) public approvedPairTokens;
     mapping(address pairToken => PairTokenEconomics economics) public pairTokenEconomics;
     mapping(address token => FeePolicySnapshot policy) private _launchFeePolicies;
@@ -406,6 +433,18 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
         if (launcher == address(0)) revert ZeroAddress();
         whitelistedLaunchers[launcher] = enabled;
         emit WhitelistedLauncherUpdated(launcher, enabled);
+    }
+
+    /**
+     * @notice Trusts or untrusts a router for launchTokenFor.
+     * @dev Owner-gated because a router chooses the launcher address it
+     * attributes a launch to. It cannot mint eligibility, but it can decide
+     * whose name a launch carries, which is enough to warrant a gate.
+     */
+    function setTrustedRouter(address router, bool trusted) external onlyOwner {
+        if (router == address(0)) revert ZeroAddress();
+        trustedRouters[router] = trusted;
+        emit TrustedRouterUpdated(router, trusted);
     }
 
     /**
@@ -570,6 +609,37 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
      * creator supplies rather than one the protocol sets, so a change makes
      * the launch revert on its own rather than silently reprice.
      */
+    /**
+     * @dev Rejects opening-window terms no curve could accept. The combined
+     * ceiling is checked here against the base trade fee only, not against
+     * `maxCreatorTaxBps`: pairing the worst-case creator tax with the worst-
+     * case opening tax would cap a config at roughly 88% for the sake of a
+     * combination most launches never reach. The curve enforces the exact
+     * bound against the creator tax actually chosen, so an incompatible pair
+     * fails at launch rather than being forbidden at configuration.
+     */
+    function _validateSnipeTaxTerms(SnipeTaxTerms calldata terms, uint256 curveFeeBps) private pure {
+        if (terms.startBps == 0) {
+            if (terms.window != 0 || terms.halfLife != 0) revert SnipeTaxTermsInvalid();
+            return;
+        }
+        if (terms.startBps > MAX_SNIPE_TAX_START_BPS) revert SnipeTaxTermsInvalid();
+        if (terms.window == 0 || terms.window > MAX_SNIPE_TAX_WINDOW) revert SnipeTaxTermsInvalid();
+        if (terms.halfLife == 0 || terms.halfLife > terms.window) revert SnipeTaxTermsInvalid();
+        if (curveFeeBps + terms.startBps > BASIS_POINTS - MIN_BUYER_SHARE_BPS) {
+            revert SnipeTaxTermsInvalid();
+        }
+    }
+
+    /**
+     * @notice Whether `account` may create a launch right now. Equivalent to
+     * the gate launchToken applies, exposed so a router can enforce the
+     * caller's own eligibility rather than borrowing its own.
+     */
+    function canLaunch(address account) public view returns (bool) {
+        return launchEnabled || whitelistedLaunchers[account];
+    }
+
     function _economicsDigest(
         LaunchConfig memory config,
         FeePolicySnapshot memory policy,
@@ -587,7 +657,10 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
                 policy.protocolFeeShareBps,
                 policy.buybackBurnBps,
                 policy.hookFeeBps,
-                policy.maxInternalPriceImpactBps
+                policy.maxInternalPriceImpactBps,
+                config.snipeTax.startBps,
+                config.snipeTax.window,
+                config.snipeTax.halfLife
             )
         );
     }
@@ -604,9 +677,48 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
         nonReentrant
         returns (address token, address curve)
     {
+        return _launchToken(params, launchConfigId, pairToken, msg.sender, new address[](0));
+    }
+
+    /**
+     * @notice Launch with addresses excused from the opening window, and
+     * optionally on someone else's behalf.
+     *
+     * The launcher and the creator fee recipient are excused automatically;
+     * `snipeTaxExemptions` is for the rest of a team or a known market maker.
+     * Exemptions are fixed at creation and never extendable — granting one
+     * after a launch is live would wave an address through a window every
+     * other buyer paid to cross, so there is no setter anywhere.
+     *
+     * @param launcher Address credited as deployer. Zero means the caller.
+     * Naming anyone else requires the caller to be a trusted router, and a
+     * router does not lend its own eligibility: `launcher` is gated through
+     * canLaunch exactly as a direct caller would be. Without that, the
+     * whitelist would be defeated by routing through a whitelisted contract.
+     */
+    function launchTokenFor(
+        TokenParams calldata params,
+        uint256 launchConfigId,
+        address pairToken,
+        address launcher,
+        address[] calldata snipeTaxExemptions
+    ) external payable nonReentrant returns (address token, address curve) {
+        address attributed = launcher == address(0) ? msg.sender : launcher;
+        if (attributed != msg.sender && !trustedRouters[msg.sender]) revert NotTrustedRouter();
+        return _launchToken(params, launchConfigId, pairToken, attributed, snipeTaxExemptions);
+    }
+
+    function _launchToken(
+        TokenParams calldata params,
+        uint256 launchConfigId,
+        address pairToken,
+        address launcher,
+        address[] memory snipeTaxExemptions
+    ) private returns (address token, address curve) {
         if (address(launchDeployer) == address(0)) revert LaunchDeployerNotSet();
         _requireLaunchDependenciesWired();
-        if (!launchEnabled && !whitelistedLaunchers[msg.sender]) revert NotWhitelisted();
+        if (!canLaunch(launcher)) revert NotWhitelisted();
+        if (snipeTaxExemptions.length > MAX_SNIPE_TAX_EXEMPTIONS) revert ExemptionListTooLong();
         if (msg.value != launchFee) revert LaunchFeeNotPaid();
         if (launchConfigId >= _launchConfigs.length) revert InvalidLaunchConfigId();
         if (bytes(params.name).length == 0 || bytes(params.symbol).length == 0) revert InvalidTokenParams();
@@ -653,13 +765,13 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
         // has their fee and nothing has been deployed.
         _requireSeedableTerms(config.supply, phantomQuote, graduationThreshold, config.tickSpacing);
 
-        address creatorFeeRecipient = params.creatorFeeRecipient == address(0) ? msg.sender : params.creatorFeeRecipient;
+        address creatorFeeRecipient = params.creatorFeeRecipient == address(0) ? launcher : params.creatorFeeRecipient;
 
         (token, curve) = launchDeployer.deployLaunch(
             LaunchDeployment({
                 pairToken: pairToken,
                 creatorFeeRecipient: creatorFeeRecipient,
-                originalDeployer: msg.sender,
+                originalDeployer: launcher,
                 feePolicy: memeHook,
                 policy: policy,
                 feeEscrow: feeEscrow,
@@ -669,6 +781,7 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
                 creatorTaxBps: params.creatorTaxBps,
                 buybackEnabled: params.buybackEnabled,
                 graduationThreshold: graduationThreshold,
+                snipeTax: config.snipeTax,
                 supply: config.supply,
                 name: params.name,
                 symbol: params.symbol,
@@ -677,12 +790,12 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
                 socials: params.socials
             })
         );
-        PonsV2BondingCurve(curve).initialize(token);
+        PonsV2BondingCurve(curve).initialize(token, launcher, snipeTaxExemptions);
 
         _launchedTokens[token] = LaunchedToken({
             token: token,
             curve: curve,
-            deployer: msg.sender,
+            deployer: launcher,
             creatorFeeRecipient: creatorFeeRecipient,
             pairToken: pairToken,
             graduationThreshold: graduationThreshold,
@@ -702,7 +815,7 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
         // protocol recipient, which may be a contract that calls back in.
         _payLaunchFee();
 
-        emit TokenLaunched(token, curve, msg.sender, pairToken, launchConfigId, graduationThreshold);
+        emit TokenLaunched(token, curve, launcher, pairToken, launchConfigId, graduationThreshold);
     }
 
     // ---------------------------------------------------------------------
@@ -1308,6 +1421,7 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
         if (config.graduationThreshold == 0) revert InvalidGraduationThreshold();
         if (config.tickSpacing <= 0 || config.tickSpacing > MAX_TICK_SPACING) revert InvalidTickSpacing();
         if (config.poolFee != 0) revert CoreLpFeeMustBeZero();
+        _validateSnipeTaxTerms(config.snipeTax, config.curveFeeBps);
         _requireQuotable(config.phantomQuote, config.supply, config.curveFeeBps);
     }
 
