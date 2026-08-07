@@ -4,7 +4,7 @@ pragma solidity ^0.8.26;
 import {PonsV2LauncherToken} from "./PonsV2LauncherToken.sol";
 import {PonsV2BondingCurve} from "./PonsV2BondingCurve.sol";
 import {PonsV2BuybackVault} from "./PonsV2BuybackVault.sol";
-import {FeePolicySnapshot, IPonsV2FeeEscrow, IPonsV2FeePolicy} from "./interfaces/ILaunchpadV2.sol";
+import {FeePolicySnapshot, IPonsV2FeeEscrow, IPonsV2FeePolicy, SnipeTaxTerms} from "./interfaces/ILaunchpadV2.sol";
 
 /**
  * @notice Every input PonsV2LaunchFactory hands the deployer to stand up one
@@ -25,6 +25,7 @@ struct LaunchDeployment {
     uint256 creatorTaxBps;
     bool buybackEnabled;
     uint256 graduationThreshold;
+    SnipeTaxTerms snipeTax;
     uint256 supply;
     string name;
     string symbol;
@@ -97,7 +98,8 @@ contract PonsV2LaunchDeployer {
                 params.curveFeeBps,
                 params.creatorTaxBps,
                 params.buybackEnabled,
-                params.graduationThreshold
+                params.graduationThreshold,
+                params.snipeTax
             )
         );
         token = address(

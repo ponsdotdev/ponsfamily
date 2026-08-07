@@ -8,7 +8,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {PonsV2BondingCurveMath} from "./libraries/PonsV2BondingCurveMath.sol";
 import {PonsV2BuybackVault} from "./PonsV2BuybackVault.sol";
 import {PonsV2LauncherToken} from "./PonsV2LauncherToken.sol";
-import {FeePolicySnapshot, IPonsV2FeeEscrow, IPonsV2FeePolicy} from "./interfaces/ILaunchpadV2.sol";
+import {FeePolicySnapshot, IPonsV2FeeEscrow, IPonsV2FeePolicy, SnipeTaxTerms} from "./interfaces/ILaunchpadV2.sol";
 import {IPonsV2LaunchFactoryGraduation} from "./interfaces/ILaunchpadV2Graduation.sol";
 
 /**
@@ -33,6 +33,20 @@ contract PonsV2BondingCurve is ReentrancyGuard {
 
     uint256 private constant BASIS_POINTS = 10_000;
     uint256 private constant MAX_TOTAL_TRADE_FEE_BPS = 2_000; // 20%
+    // The opening tax is deliberately outside MAX_TOTAL_TRADE_FEE_BPS. That
+    // ceiling protects traders from a creator's standing rake for the life of
+    // the launch; this one is a transient anti-latency measure that expires on
+    // its own within seconds. Folding the two together would either cap the
+    // opening tax at a level a bot would happily pay, or raise the standing
+    // rake ceiling to 99%. They are separate risks and get separate limits.
+    uint256 private constant MAX_SNIPE_TAX_START_BPS = 9_900; // 99%
+    // Whatever the combined legs come to, a buyer keeps at least this share of
+    // their input. It is what stops the clamped-fill gross-up denominator from
+    // approaching zero, where the ceil-rounding would blow up.
+    uint256 private constant MIN_BUYER_SHARE_BPS = 100; // 1%
+    // Written in a single launch transaction and never extended, so the bound
+    // is what keeps the launch fee from becoming a gas-griefing surface.
+    uint256 private constant MAX_SNIPE_TAX_EXEMPTIONS = 32;
 
     error CurveGraduated();
     error ZeroAmount();
@@ -51,6 +65,8 @@ contract PonsV2BondingCurve is ReentrancyGuard {
     error MinimumOutputRequired();
     error NativeValueMismatch(uint256 supplied, uint256 expected);
     error UnexpectedNativeValue();
+    error InvalidSnipeTaxTerms();
+    error ExemptionListTooLong();
 
     // `fee` and `tax` are reported separately because they fund different
     // parties: the fee splits across protocol, buyback and creator, while the
@@ -75,6 +91,12 @@ contract PonsV2BondingCurve is ReentrancyGuard {
     event CreatorFeeRecipientUpdated(address indexed previousRecipient, address indexed newRecipient);
     event BuybackEnabledUpdated(bool enabled);
     event AutoGraduationFailed(address indexed token, uint256 gasRemaining);
+    // Emitted alongside CurveBuy, never instead of it. CurveBuy's `fee` field
+    // reports the combined amount routed through the fee split so that field
+    // keeps meaning "quote the protocol took"; this event lets an indexer
+    // decompose it back out without a second ABI for CurveBuy itself.
+    event SnipeTaxCharged(address indexed payer, address indexed recipient, uint256 amount, uint256 bps);
+    event SnipeTaxExempted(address indexed account);
 
     // Not immutable: the token's constructor needs this curve's real address,
     // so the factory deploys the curve first, then the token, then wires the
@@ -109,7 +131,19 @@ contract PonsV2BondingCurve is ReentrancyGuard {
     // the creator in full.
     uint256 public immutable creatorTaxBps;
     uint256 public immutable graduationThreshold;
+    // Opening-window terms, frozen at deployment. `launchedAt` is set in the
+    // constructor rather than in initialize() so the window cannot be extended
+    // by delaying the wiring call, and so it stays immutable.
+    uint64 public immutable launchedAt;
+    uint16 public immutable snipeTaxStartBps;
+    uint32 public immutable snipeTaxWindow;
+    uint32 public immutable snipeTaxHalfLife;
     bool public buybackEnabled;
+    // Written once, inside the launch transaction, by initialize(). There is
+    // deliberately no setter: an exemption granted after launch would let a
+    // creator wave a friendly address through the window that everyone else
+    // paid to cross.
+    mapping(address => bool) public snipeTaxExempt;
 
     uint256 public quoteFeeBalance;
     // The slice of `quoteFeeBalance` already earmarked for buyback-and-lock,
@@ -178,7 +212,8 @@ contract PonsV2BondingCurve is ReentrancyGuard {
         uint256 feeBps_,
         uint256 creatorTaxBps_,
         bool buybackEnabled_,
-        uint256 graduationThreshold_
+        uint256 graduationThreshold_,
+        SnipeTaxTerms memory snipeTax_
     ) {
         if (deployer_ == address(0) || factory_ == address(0)) revert ZeroAddress();
         if (address(feePolicy_) == address(0) || address(feeEscrow_) == address(0)) revert ZeroAddress();
@@ -194,6 +229,30 @@ contract PonsV2BondingCurve is ReentrancyGuard {
         // defends its own invariant rather than inheriting it: a combined fee
         // at or above the whole trade would break the quote accounting.
         if (feeBps_ + creatorTaxBps_ > MAX_TOTAL_TRADE_FEE_BPS) revert InvalidFeePolicy();
+        // Zero start disables the window; anything else has to describe a
+        // window that actually closes, or a launch could tax buys forever.
+        if (snipeTax_.startBps != 0) {
+            if (snipeTax_.startBps > MAX_SNIPE_TAX_START_BPS) revert InvalidSnipeTaxTerms();
+            if (snipeTax_.window == 0 || snipeTax_.halfLife == 0) revert InvalidSnipeTaxTerms();
+            if (snipeTax_.halfLife > snipeTax_.window) revert InvalidSnipeTaxTerms();
+            // The binding constraint for buy(): at maximum tax the gross-up
+            // denominator is BASIS_POINTS minus all three legs, and it has to
+            // stay comfortably positive. Checked here so buy() can rely on it
+            // unconditionally rather than re-deriving it every call.
+            if (feeBps_ + creatorTaxBps_ + snipeTax_.startBps > BASIS_POINTS - MIN_BUYER_SHARE_BPS) {
+                revert InvalidSnipeTaxTerms();
+            }
+        } else if (snipeTax_.window != 0 || snipeTax_.halfLife != 0) {
+            // Terms that look configured but do nothing are almost always a
+            // caller mistake, and a silently inert window is worse than a
+            // revert at launch.
+            revert InvalidSnipeTaxTerms();
+        }
+
+        launchedAt = uint64(block.timestamp);
+        snipeTaxStartBps = snipeTax_.startBps;
+        snipeTaxWindow = snipeTax_.window;
+        snipeTaxHalfLife = snipeTax_.halfLife;
 
         pairToken = pairToken_;
         deployer = deployer_;
@@ -240,9 +299,22 @@ contract PonsV2BondingCurve is ReentrancyGuard {
      * one is used as the trigger, the graduated pool is seeded with the same
      * amounts at the same price on every launch.
      */
-    function initialize(address token_) external onlyFactory {
+    function initialize(address token_, address launcher, address[] calldata snipeTaxExemptions)
+        external
+        onlyFactory
+    {
         if (token != address(0)) revert AlreadyInitialized();
         if (token_ == address(0)) revert ZeroAddress();
+        // Bounded, and written in the same transaction as the launch itself.
+        if (snipeTaxExemptions.length > MAX_SNIPE_TAX_EXEMPTIONS) revert ExemptionListTooLong();
+        // Both excused unconditionally. A creator paying a 99% levy to seed
+        // their own launch would make this a tax on launching rather than a
+        // tax on racing. `deployer` holds the creator fee recipient here.
+        _exempt(launcher);
+        _exempt(deployer);
+        for (uint256 i = 0; i < snipeTaxExemptions.length; ++i) {
+            _exempt(snipeTaxExemptions[i]);
+        }
         token = token_;
 
         uint256 supply = IERC20(token_).totalSupply();
@@ -362,6 +434,46 @@ contract PonsV2BondingCurve is ReentrancyGuard {
      * own arguments, and when nothing is clamped it reduces exactly to
      * `tokensOut >= minTokensOut`.
      */
+    /**
+     * @notice Opening buy tax in basis points that `recipient` would pay right
+     * now. Zero once the window has closed, for an exempt address, or for a
+     * launch configured without a window.
+     *
+     * @dev Exponential decay evaluated in integer arithmetic: the tax halves
+     * every `snipeTaxHalfLife` seconds, with a linear interpolation between
+     * halvings so the curve does not fall in visible cliffs. Deliberately not
+     * a fixed-point exp(): this is read inside buy() on every trade, and an
+     * approximation that is monotonically decreasing and provably bounded by
+     * `snipeTaxStartBps` is worth more here than one that is precise.
+     *
+     * Keyed on the token recipient rather than msg.sender. Keying it on the
+     * caller would mean any router — including one a sniper deploys — could
+     * be exempted once and then resell entry to the window.
+     */
+    function _exempt(address account) private {
+        // Duplicates and the zero address are skipped rather than rejected:
+        // the list is assembled from three sources that do not know about each
+        // other, and a cosmetic overlap should not fail a valid launch.
+        if (account == address(0) || snipeTaxExempt[account]) return;
+        snipeTaxExempt[account] = true;
+        emit SnipeTaxExempted(account);
+    }
+
+    function currentSnipeTaxBps(address recipient) public view returns (uint256) {
+        if (snipeTaxStartBps == 0 || snipeTaxExempt[recipient]) return 0;
+        uint256 elapsed = block.timestamp - launchedAt;
+        if (elapsed >= snipeTaxWindow) return 0;
+
+        uint256 steps = elapsed / snipeTaxHalfLife;
+        // Past sixteen halvings the result rounds to zero in basis points
+        // anyway, and the shift below would be undefined for large shifts.
+        if (steps >= 16) return 0;
+        uint256 upper = uint256(snipeTaxStartBps) >> steps;
+        uint256 lower = upper >> 1;
+        uint256 into = elapsed % snipeTaxHalfLife;
+        return upper - ((upper - lower) * into) / snipeTaxHalfLife;
+    }
+
     function buy(uint256 quoteIn, uint256 minTokensOut, address recipient)
         external
         payable
@@ -384,10 +496,17 @@ contract PonsV2BondingCurve is ReentrancyGuard {
         uint256 quoteReserveBefore = phantomQuote + trackedQuote - quoteFeeBalance - creatorTaxBalance;
         uint256 tokenReserveBefore = trackedTokens;
 
+        // Read once and reused for the clamped-fill branch: a second read
+        // would return the same value in the same block, but pinning it makes
+        // the gross-up denominator provably the one the fill was priced with.
+        uint256 snipeBps = currentSnipeTaxBps(recipient);
+
         uint256 spent = received;
         uint256 fee = (spent * feeBps) / BASIS_POINTS;
         uint256 tax = (spent * creatorTaxBps) / BASIS_POINTS;
-        tokensOut = PonsV2BondingCurveMath.getAmountOut(spent - fee - tax, quoteReserveBefore, tokenReserveBefore, 0);
+        uint256 snipe = (spent * snipeBps) / BASIS_POINTS;
+        tokensOut =
+            PonsV2BondingCurveMath.getAmountOut(spent - fee - tax - snipe, quoteReserveBefore, tokenReserveBefore, 0);
 
         uint256 sellable = tokenReserveBefore > reservedTokens ? tokenReserveBefore - reservedTokens : 0;
         if (sellable == 0) revert CurveGraduated();
@@ -396,20 +515,35 @@ contract PonsV2BondingCurve is ReentrancyGuard {
             tokensOut = sellable;
             // Price the clamped fill from the token side, then gross the
             // result back up so the fee legs still come out of the input.
+            // The denominator is bounded below by MIN_BUYER_SHARE_BPS by the
+            // constructor's check, so it cannot approach zero here.
             uint256 net = PonsV2BondingCurveMath.getAmountIn(sellable, quoteReserveBefore, tokenReserveBefore, 0);
             spent = Math.min(
-                Math.mulDiv(net, BASIS_POINTS, BASIS_POINTS - feeBps - creatorTaxBps, Math.Rounding.Ceil), received
+                Math.mulDiv(net, BASIS_POINTS, BASIS_POINTS - feeBps - creatorTaxBps - snipeBps, Math.Rounding.Ceil),
+                received
             );
             fee = (spent * feeBps) / BASIS_POINTS;
             tax = (spent * creatorTaxBps) / BASIS_POINTS;
+            snipe = (spent * snipeBps) / BASIS_POINTS;
         }
+
+        // A buy that yields nothing is a buy that only pays fees. Reachable
+        // for dust inside the opening window, where the levy consumes the
+        // whole input before it reaches the curve. Refusing it is strictly
+        // safer than settling it: nobody is denied a fill they would have
+        // wanted, and the caller keeps their funds.
+        if (tokensOut == 0) revert ZeroAmount();
 
         // Price bound rather than quantity bound, so a partial fill honours
         // the caller's terms instead of failing them. Identical to
         // `tokensOut >= minTokensOut` whenever `spent == received`.
         if (spent * minTokensOut > received * tokensOut) revert SlippageExceeded(tokensOut, minTokensOut);
 
-        _accrueFees(fee, tax);
+        // The levy joins the base fee rather than travelling in its own
+        // bucket, so it flows through the existing protocol / buyback /
+        // creator split untouched. No new distribution path means no new
+        // surface for it to be diverted through.
+        _accrueFees(fee + snipe, tax);
         trackedQuote += spent;
         trackedTokens -= tokensOut;
         IERC20(token).safeTransfer(recipient, tokensOut);
@@ -420,7 +554,8 @@ contract PonsV2BondingCurve is ReentrancyGuard {
             _sendQuote(msg.sender, refund);
         }
 
-        emit CurveBuy(msg.sender, recipient, spent, tokensOut, fee, tax);
+        if (snipe != 0) emit SnipeTaxCharged(msg.sender, recipient, snipe, snipeBps);
+        emit CurveBuy(msg.sender, recipient, spent, tokensOut, fee + snipe, tax);
         _tryAutoGraduate();
     }
 

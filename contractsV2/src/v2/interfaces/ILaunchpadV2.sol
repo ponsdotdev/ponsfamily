@@ -42,6 +42,33 @@ struct FeePolicySnapshot {
 }
 
 /**
+ * @notice Opening-window buy tax terms, frozen into a curve at deployment.
+ *
+ * The tax decays from `startBps` to zero over `window` seconds, halving once
+ * per `halfLife` seconds, and applies to buys only. It exists to price out
+ * latency racing at t=0: Robinhood Chain sequences first-come-first-served
+ * with no public mempool, so the contestable edge is measured in the
+ * milliseconds between the launch transaction landing and a listener's buy
+ * reaching the sequencer. A quantity cap cannot reach that edge because it is
+ * defeated by splitting wallets; a tax priced per unit of capital can.
+ *
+ * `startBps == 0` disables the mechanism entirely and restores the curve's
+ * original behaviour, so existing launch configs remain expressible.
+ *
+ * @dev Resolution is deliberately whole seconds. `block.timestamp` is the
+ * only clock available here: on an Arbitrum Orbit chain `block.number`
+ * approximates the *L1* block number and cannot be used to measure L2 time.
+ * Every block inside the same second therefore sees the same tax, which is
+ * the intended behaviour rather than a limitation — a bot's advantage over a
+ * human is sub-second, so a one-second floor removes it wholesale.
+ */
+struct SnipeTaxTerms {
+    uint16 startBps;
+    uint32 window;
+    uint32 halfLife;
+}
+
+/**
  * @notice Protocol-owned fee policy read by every bonding curve and by the
  * meme hook. The current policy is snapshotted at launch, while the live
  * sweep operator remains rotatable for operational liveness.
