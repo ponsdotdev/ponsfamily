@@ -8,7 +8,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {PonsV2BondingCurveMath} from "./libraries/PonsV2BondingCurveMath.sol";
 import {PonsV2BuybackVault} from "./PonsV2BuybackVault.sol";
 import {PonsV2LauncherToken} from "./PonsV2LauncherToken.sol";
-import {FeePolicySnapshot, IPonsV2FeeEscrow, IPonsV2FeePolicy} from "./interfaces/ILaunchpadV2.sol";
+import {FeePolicySnapshot, IPonsV2FeeEscrow, IPonsV2FeePolicy, IPonsV2SnipeTax} from "./interfaces/ILaunchpadV2.sol";
 import {IPonsV2LaunchFactoryGraduation} from "./interfaces/ILaunchpadV2Graduation.sol";
 
 /**
@@ -75,6 +75,8 @@ contract PonsV2BondingCurve is ReentrancyGuard {
     event CreatorFeeRecipientUpdated(address indexed previousRecipient, address indexed newRecipient);
     event BuybackEnabledUpdated(bool enabled);
     event AutoGraduationFailed(address indexed token, uint256 gasRemaining);
+    event SnipeTaxExempted(address indexed account);
+    event SnipeTaxCharged(address indexed recipient, uint256 amount);
 
     // Not immutable: the token's constructor needs this curve's real address,
     // so the factory deploys the curve first, then the token, then wires the
@@ -141,6 +143,11 @@ contract PonsV2BondingCurve is ReentrancyGuard {
     // and handed to the graduated pool intact. Everything above it is the
     // sellable allocation, and graduation is exactly its exhaustion.
     uint256 public reservedTokens;
+    uint256 public launchSupply;
+    uint256 public launchedAt;
+    uint256 public snipeTaxStartBps;
+    uint256 public snipeTaxSeconds;
+    mapping(address account => bool exempt) public snipeTaxExempt;
 
     modifier onlyFactory() {
         if (msg.sender != factory) revert NotFactory();
@@ -252,6 +259,10 @@ contract PonsV2BondingCurve is ReentrancyGuard {
         // Rejecting the config here fails at launch rather than at graduation.
         if (reserved == 0 || reserved >= supply) revert InvalidLaunchEconomics();
         reservedTokens = reserved;
+        launchSupply = supply;
+        launchedAt = block.timestamp;
+        snipeTaxStartBps = IPonsV2SnipeTax(factory).snipeTaxStartBps();
+        snipeTaxSeconds = IPonsV2SnipeTax(factory).snipeTaxSeconds();
         // The allocation the curve actually received, which is the whole
         // supply: the token mints to this curve in its own constructor.
         trackedTokens = IERC20(token_).balanceOf(address(this));
@@ -265,6 +276,21 @@ contract PonsV2BondingCurve is ReentrancyGuard {
     function sellableTokens() public view returns (uint256) {
         uint256 tracked = trackedTokens;
         return tracked > reservedTokens ? tracked - reservedTokens : 0;
+    }
+
+    function currentSnipeTaxBps(address recipient) public view returns (uint256) {
+        if (snipeTaxExempt[recipient]) return 0;
+        uint256 startBps = snipeTaxStartBps;
+        if (startBps == 0) return 0;
+        uint256 elapsed = block.timestamp - launchedAt;
+        uint256 window = snipeTaxSeconds;
+        if (elapsed >= window) return 0;
+        return startBps >> ((elapsed * 14) / window);
+    }
+
+    function exemptFromSnipeTax(address account) external onlyFactory {
+        snipeTaxExempt[account] = true;
+        emit SnipeTaxExempted(account);
     }
 
     /**
@@ -384,10 +410,19 @@ contract PonsV2BondingCurve is ReentrancyGuard {
         uint256 quoteReserveBefore = phantomQuote + trackedQuote - quoteFeeBalance - creatorTaxBalance;
         uint256 tokenReserveBefore = trackedTokens;
 
+        uint256 snipeTaxBps = currentSnipeTaxBps(recipient);
+        if (snipeTaxBps != 0) {
+            uint256 maxSnipeTaxBps = BASIS_POINTS - feeBps - creatorTaxBps - 100;
+            if (snipeTaxBps > maxSnipeTaxBps) snipeTaxBps = maxSnipeTaxBps;
+        }
+
         uint256 spent = received;
         uint256 fee = (spent * feeBps) / BASIS_POINTS;
         uint256 tax = (spent * creatorTaxBps) / BASIS_POINTS;
-        tokensOut = PonsV2BondingCurveMath.getAmountOut(spent - fee - tax, quoteReserveBefore, tokenReserveBefore, 0);
+        uint256 snipeTax = (spent * snipeTaxBps) / BASIS_POINTS;
+        tokensOut = PonsV2BondingCurveMath.getAmountOut(
+            spent - fee - tax - snipeTax, quoteReserveBefore, tokenReserveBefore, 0
+        );
 
         uint256 sellable = tokenReserveBefore > reservedTokens ? tokenReserveBefore - reservedTokens : 0;
         if (sellable == 0) revert CurveGraduated();
@@ -398,10 +433,12 @@ contract PonsV2BondingCurve is ReentrancyGuard {
             // result back up so the fee legs still come out of the input.
             uint256 net = PonsV2BondingCurveMath.getAmountIn(sellable, quoteReserveBefore, tokenReserveBefore, 0);
             spent = Math.min(
-                Math.mulDiv(net, BASIS_POINTS, BASIS_POINTS - feeBps - creatorTaxBps, Math.Rounding.Ceil), received
+                Math.mulDiv(net, BASIS_POINTS, BASIS_POINTS - feeBps - creatorTaxBps - snipeTaxBps, Math.Rounding.Ceil),
+                received
             );
             fee = (spent * feeBps) / BASIS_POINTS;
             tax = (spent * creatorTaxBps) / BASIS_POINTS;
+            snipeTax = (spent * snipeTaxBps) / BASIS_POINTS;
         }
 
         // Price bound rather than quantity bound, so a partial fill honours
@@ -409,7 +446,7 @@ contract PonsV2BondingCurve is ReentrancyGuard {
         // `tokensOut >= minTokensOut` whenever `spent == received`.
         if (spent * minTokensOut > received * tokensOut) revert SlippageExceeded(tokensOut, minTokensOut);
 
-        _accrueFees(fee, tax);
+        _accrueFees(fee + snipeTax, tax);
         trackedQuote += spent;
         trackedTokens -= tokensOut;
         IERC20(token).safeTransfer(recipient, tokensOut);
@@ -420,7 +457,8 @@ contract PonsV2BondingCurve is ReentrancyGuard {
             _sendQuote(msg.sender, refund);
         }
 
-        emit CurveBuy(msg.sender, recipient, spent, tokensOut, fee, tax);
+        if (snipeTax != 0) emit SnipeTaxCharged(recipient, snipeTax);
+        emit CurveBuy(msg.sender, recipient, spent, tokensOut, fee + snipeTax, tax);
         _tryAutoGraduate();
     }
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
-           
+
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -699,7 +699,7 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
         nonReentrant
         returns (address token, address curve)
     {
-        return _launchToken(params, launchConfigId, pairToken, msg.sender);
+        return _launchToken(params, launchConfigId, pairToken, msg.sender, bytes(""));
     }
 
     /**
@@ -716,7 +716,7 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
         address pairToken,
         address[] calldata snipeTaxExemptions
     ) external payable nonReentrant returns (address token, address curve) {
-        (token, curve) = _launchToken(params, launchConfigId, pairToken, msg.sender);
+        (token, curve) = _launchToken(params, launchConfigId, pairToken, msg.sender, bytes(""));
         _exemptFromSnipeTax(curve, snipeTaxExemptions);
     }
 
@@ -727,15 +727,17 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
      * This preserves the real caller without `tx.origin`, which breaks through
      * account-abstraction relayers and must never be used for authorization.
      */
-    function launchTokenFor(
+    function launchProjectTokenFor(
         TokenParams calldata params,
         uint256 launchConfigId,
         address pairToken,
         address originalDeployer,
-        address[] calldata snipeTaxExemptions
+        address[] calldata snipeTaxExemptions,
+        bytes calldata projectTokenData
     ) external payable nonReentrant returns (address token, address curve) {
         if (msg.sender != launchForwarder) revert NotLaunchForwarder();
-        (token, curve) = _launchToken(params, launchConfigId, pairToken, originalDeployer);
+        if (projectTokenData.length == 0) revert InvalidTokenParams();
+        (token, curve) = _launchToken(params, launchConfigId, pairToken, originalDeployer, projectTokenData);
         _exemptFromSnipeTax(curve, snipeTaxExemptions);
     }
 
@@ -759,7 +761,8 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
         TokenParams calldata params,
         uint256 launchConfigId,
         address pairToken,
-        address originalDeployer
+        address originalDeployer,
+        bytes memory projectTokenData
     ) private returns (address token, address curve) {
         if (address(launchDeployer) == address(0)) revert LaunchDeployerNotSet();
         _requireLaunchDependenciesWired();
@@ -813,29 +816,30 @@ contract PonsV2LaunchFactory is Ownable2Step, ReentrancyGuard, IPonsV2LaunchFact
         address creatorFeeRecipient =
             params.creatorFeeRecipient == address(0) ? originalDeployer : params.creatorFeeRecipient;
 
-        (token, curve) = launchDeployer.deployLaunch(
-            LaunchDeployment({
-                pairToken: pairToken,
-                creatorFeeRecipient: creatorFeeRecipient,
-                originalDeployer: originalDeployer,
-                feePolicy: memeHook,
-                policy: policy,
-                feeEscrow: feeEscrow,
-                buybackVault: buybackVault,
-                phantomQuote: phantomQuote,
-                curveFeeBps: config.curveFeeBps,
-                creatorTaxBps: params.creatorTaxBps,
-                buybackEnabled: params.buybackEnabled,
-                graduationThreshold: graduationThreshold,
-                supply: config.supply,
-                salt: params.salt,
-                name: params.name,
-                symbol: params.symbol,
-                logo: params.logo,
-                description: params.description,
-                socials: params.socials
-            })
-        );
+        LaunchDeployment memory deployment = LaunchDeployment({
+            pairToken: pairToken,
+            creatorFeeRecipient: creatorFeeRecipient,
+            originalDeployer: originalDeployer,
+            feePolicy: memeHook,
+            policy: policy,
+            feeEscrow: feeEscrow,
+            buybackVault: buybackVault,
+            phantomQuote: phantomQuote,
+            curveFeeBps: config.curveFeeBps,
+            creatorTaxBps: params.creatorTaxBps,
+            buybackEnabled: params.buybackEnabled,
+            graduationThreshold: graduationThreshold,
+            supply: config.supply,
+            salt: params.salt,
+            name: params.name,
+            symbol: params.symbol,
+            logo: params.logo,
+            description: params.description,
+            socials: params.socials
+        });
+        (token, curve) = projectTokenData.length == 0
+            ? launchDeployer.deployLaunch(deployment)
+            : launchDeployer.deployProjectLaunch(deployment, projectTokenData);
         PonsV2BondingCurve(curve).initialize(token);
 
         // The creator's own addresses never count as snipers on their own
