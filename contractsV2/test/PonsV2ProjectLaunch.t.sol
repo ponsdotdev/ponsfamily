@@ -8,12 +8,8 @@ import {PonsV2BuybackVault} from "../src/v2/PonsV2BuybackVault.sol";
 import {LaunchDeployment, PonsV2LaunchDeployer, ProjectTokenDeploymentData} from "../src/v2/PonsV2LaunchDeployer.sol";
 import {PonsV2LauncherToken} from "../src/v2/PonsV2LauncherToken.sol";
 import {FeePolicySnapshot, IPonsV2FeeEscrow, IPonsV2FeePolicy} from "../src/v2/interfaces/ILaunchpadV2.sol";
-import {
-    PonsProjectVotesToken
-} from "@sinjoh-v2/token/PonsProjectVotesToken.sol";
-import {
-    ProjectVotesTokenFactoryV2
-} from "@sinjoh-v2/token/ProjectVotesTokenFactoryV2.sol";
+import {PonsProjectVotesToken} from "@sinjoh-v2/token/PonsProjectVotesToken.sol";
+import {ProjectVotesTokenFactoryV2} from "@sinjoh-v2/token/ProjectVotesTokenFactoryV2.sol";
 
 contract MockProjectRegistry {}
 
@@ -101,6 +97,7 @@ contract PonsV2ProjectLaunchTest is Test {
         assertEq(token.registry(), address(registry));
         assertEq(token.creator(), CREATOR);
         assertEq(token.deployer(), CREATOR);
+        assertEq(token.votingExclusionConfigurator(), address(this));
         assertEq(token.initialSupply(), SUPPLY);
         assertEq(token.totalSupply(), SUPPLY);
         assertEq(token.balanceOf(curveAddress), SUPPLY);
@@ -140,7 +137,10 @@ contract PonsV2ProjectLaunchTest is Test {
     function _projectData(address[] memory exclusions) private view returns (bytes memory) {
         return abi.encode(
             ProjectTokenDeploymentData({
-                tokenFactory: address(tokenFactory), registry: address(registry), votingExclusions: exclusions
+                tokenFactory: address(tokenFactory),
+                registry: address(registry),
+                votingExclusionConfigurator: address(this),
+                votingExclusions: exclusions
             })
         );
     }

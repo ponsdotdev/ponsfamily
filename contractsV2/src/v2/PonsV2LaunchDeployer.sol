@@ -28,6 +28,7 @@ interface IProjectVotesTokenFactoryV2 {
         address creator;
         address curve;
         address launchFactory;
+        address votingExclusionConfigurator;
         uint256 supply;
         address[] votingExclusions;
     }
@@ -57,6 +58,7 @@ interface IPonsProjectVotesToken {
 struct ProjectTokenDeploymentData {
     address tokenFactory;
     address registry;
+    address votingExclusionConfigurator;
     address[] votingExclusions;
 }
 
@@ -225,7 +227,10 @@ contract PonsV2LaunchDeployer {
         address curve,
         ProjectTokenDeploymentData memory project
     ) private returns (address token) {
-        if (project.registry.code.length == 0 || project.tokenFactory.code.length == 0) {
+        if (
+            project.registry.code.length == 0 || project.tokenFactory.code.length == 0
+                || project.votingExclusionConfigurator.code.length == 0
+        ) {
             revert InvalidProjectToken(address(0));
         }
         token = IProjectVotesTokenFactoryV2(project.tokenFactory)
@@ -264,6 +269,7 @@ contract PonsV2LaunchDeployer {
                 creator: params.originalDeployer,
                 curve: curve,
                 launchFactory: factory,
+                votingExclusionConfigurator: project.votingExclusionConfigurator,
                 supply: params.supply,
                 votingExclusions: project.votingExclusions
             }),
