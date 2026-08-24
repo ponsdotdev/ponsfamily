@@ -77,12 +77,8 @@ contract PonsV2ProjectLaunchTest is Test {
 
     function testProjectLaunchDeploysOnePonsAndGovernanceToken() public {
         LaunchDeployment memory launch = _launchDeployment();
-        bytes memory emptyProjectData = _projectData(new address[](0));
-        (, address predictedCurve) = deployer.predictProjectLaunchAddresses(launch, emptyProjectData);
-
-        address[] memory exclusions = new address[](1);
-        exclusions[0] = predictedCurve;
-        bytes memory projectData = _projectData(exclusions);
+        bytes memory projectData = _projectData(new address[](0));
+        (, address predictedCurve) = deployer.predictProjectLaunchAddresses(launch, projectData);
         (address predictedToken, address curvePrediction) = deployer.predictProjectLaunchAddresses(launch, projectData);
         assertEq(curvePrediction, predictedCurve);
 
@@ -101,6 +97,12 @@ contract PonsV2ProjectLaunchTest is Test {
         assertEq(token.initialSupply(), SUPPLY);
         assertEq(token.totalSupply(), SUPPLY);
         assertEq(token.balanceOf(curveAddress), SUPPLY);
+        assertEq(token.eligibleVotingSupply(), SUPPLY);
+        assertFalse(token.isVotingExcluded(curveAddress));
+
+        address[] memory finalExclusions = new address[](1);
+        finalExclusions[0] = curveAddress;
+        token.finalizeVotingExclusions(finalExclusions);
         assertEq(token.eligibleVotingSupply(), 0);
         assertTrue(token.isVotingExcluded(curveAddress));
 

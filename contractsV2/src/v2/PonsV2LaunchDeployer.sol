@@ -51,6 +51,7 @@ interface IPonsProjectVotesToken {
     function deployer() external view returns (address);
     function launchFactory() external view returns (address);
     function curve() external view returns (address);
+    function votingExclusionConfigurator() external view returns (address);
     function initialSupply() external view returns (uint256);
     function isVotingExcluded(address account) external view returns (bool);
 }
@@ -240,9 +241,10 @@ contract PonsV2LaunchDeployer {
             token.code.length == 0 || projectToken.registry() != project.registry
                 || projectToken.creator() != params.originalDeployer
                 || projectToken.deployer() != params.originalDeployer || projectToken.launchFactory() != factory
-                || projectToken.curve() != curve || projectToken.initialSupply() != params.supply
-                || IERC20(token).totalSupply() != params.supply || IERC20(token).balanceOf(curve) != params.supply
-                || !projectToken.isVotingExcluded(curve)
+                || projectToken.curve() != curve
+                || projectToken.votingExclusionConfigurator() != project.votingExclusionConfigurator
+                || projectToken.initialSupply() != params.supply || IERC20(token).totalSupply() != params.supply
+                || IERC20(token).balanceOf(curve) != params.supply
         ) revert InvalidProjectToken(token);
     }
 
