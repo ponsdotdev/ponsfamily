@@ -60,7 +60,7 @@ contract PonsV2TwoWayFeeSplitterTest {
         escrow = new MockPonsV2FeeEscrow();
         controls = new MockPonsV2CreatorControls();
         token = new MockERC20();
-        splitter = _deploy(RECIPIENT_ONE, RECIPIENT_TWO, 8_000, address(controls), CONTROLLER);
+        splitter = _deploy(RECIPIENT_ONE, RECIPIENT_TWO, 16, 4, address(controls), CONTROLLER);
     }
 
     function testConstructorStoresImmutableTerms() public view {
@@ -69,8 +69,10 @@ contract PonsV2TwoWayFeeSplitterTest {
         _assertEq(splitter.controller(), CONTROLLER);
         _assertEq(splitter.recipientOne(), RECIPIENT_ONE);
         _assertEq(splitter.recipientTwo(), RECIPIENT_TWO);
-        _assertEq(splitter.recipientOneShareBps(), 8_000);
-        _assertEq(splitter.recipientTwoShareBps(), 2_000);
+        _assertEq(splitter.SHARE_UNITS(), 20);
+        _assertEq(splitter.PERCENT_PER_SHARE_UNIT(), 5);
+        _assertEq(splitter.recipientOneShareUnits(), 16);
+        _assertEq(splitter.recipientTwoShareUnits(), 4);
     }
 
     function testClaimsAndSplitsNativeFees() public {
@@ -114,20 +116,37 @@ contract PonsV2TwoWayFeeSplitterTest {
         _assertEq(token.balanceOf(address(splitter)), 0);
     }
 
-    function testRoundingRemainderAlwaysGoesToRecipientTwo() public {
-        PonsV2TwoWayFeeSplitter thirds = _deploy(RECIPIENT_ONE, RECIPIENT_TWO, 3_333, address(0), address(0));
+    function testRemainderCarryMakesTinyAllocationsMatchOneBatch() public {
+        PonsV2TwoWayFeeSplitter batched = _deploy(RECIPIENT_ONE, RECIPIENT_TWO, 16, 4, address(0), address(0));
+        PonsV2TwoWayFeeSplitter oneBatch = _deploy(RECIPIENT_ONE, RECIPIENT_TWO, 16, 4, address(0), address(0));
 
-        (bool sent,) = address(thirds).call{value: 5}("");
-        require(sent, "native funding failed");
-        thirds.allocateNative();
+        for (uint256 i; i < 5; ++i) {
+            (bool tinySent,) = address(batched).call{value: 1}("");
+            require(tinySent, "native funding failed");
+            batched.allocateNative();
 
-        token.mint(address(thirds), 5);
-        thirds.allocateToken(token);
+            token.mint(address(batched), 1);
+            batched.allocateToken(token);
+        }
 
-        _assertEq(thirds.pendingNative(RECIPIENT_ONE), 1);
-        _assertEq(thirds.pendingNative(RECIPIENT_TWO), 4);
-        _assertEq(thirds.pendingToken(address(token), RECIPIENT_ONE), 1);
-        _assertEq(thirds.pendingToken(address(token), RECIPIENT_TWO), 4);
+        (bool batchSent,) = address(oneBatch).call{value: 5}("");
+        require(batchSent, "native funding failed");
+        oneBatch.allocateNative();
+        token.mint(address(oneBatch), 5);
+        oneBatch.allocateToken(token);
+
+        _assertEq(batched.pendingNative(RECIPIENT_ONE), oneBatch.pendingNative(RECIPIENT_ONE));
+        _assertEq(batched.pendingNative(RECIPIENT_TWO), oneBatch.pendingNative(RECIPIENT_TWO));
+        _assertEq(
+            batched.pendingToken(address(token), RECIPIENT_ONE), oneBatch.pendingToken(address(token), RECIPIENT_ONE)
+        );
+        _assertEq(
+            batched.pendingToken(address(token), RECIPIENT_TWO), oneBatch.pendingToken(address(token), RECIPIENT_TWO)
+        );
+        _assertEq(batched.pendingNative(RECIPIENT_ONE), 4);
+        _assertEq(batched.pendingNative(RECIPIENT_TWO), 1);
+        _assertEq(batched.nativeRecipientOneRemainder(), 0);
+        _assertEq(batched.tokenRecipientOneRemainder(address(token)), 0);
     }
 
     function testDirectTransfersAreAllocatedWithoutPonsClaim() public {
@@ -143,10 +162,12 @@ contract PonsV2TwoWayFeeSplitterTest {
         _assertEq(splitter.pendingToken(address(token), RECIPIENT_TWO), 1);
     }
 
-    function testFuzzAllocationConservesNativeAndToken(uint96 rawAmount, uint16 rawShare) public {
+    function testFuzzAllocationConservesNativeAndToken(uint96 rawAmount, uint16 rawFirstShareUnits) public {
         uint256 amount = uint256(rawAmount) + 1;
-        uint16 firstShare = uint16((uint256(rawShare) % 9_999) + 1);
-        PonsV2TwoWayFeeSplitter fuzzed = _deploy(RECIPIENT_ONE, RECIPIENT_TWO, firstShare, address(0), address(0));
+        uint8 firstShareUnits = uint8((uint256(rawFirstShareUnits) % 19) + 1);
+        uint8 secondShareUnits = 20 - firstShareUnits;
+        PonsV2TwoWayFeeSplitter fuzzed =
+            _deploy(RECIPIENT_ONE, RECIPIENT_TWO, firstShareUnits, secondShareUnits, address(0), address(0));
 
         VM.deal(address(this), amount);
         (bool sent,) = address(fuzzed).call{value: amount}("");
@@ -156,7 +177,7 @@ contract PonsV2TwoWayFeeSplitterTest {
         _assertEq(fuzzed.allocateNative(), amount);
         _assertEq(fuzzed.allocateToken(token), amount);
 
-        uint256 expectedFirst = (amount * firstShare) / 10_000;
+        uint256 expectedFirst = (amount * firstShareUnits) / 20;
         uint256 expectedSecond = amount - expectedFirst;
         _assertEq(fuzzed.pendingNative(RECIPIENT_ONE), expectedFirst);
         _assertEq(fuzzed.pendingNative(RECIPIENT_TWO), expectedSecond);
@@ -165,10 +186,45 @@ contract PonsV2TwoWayFeeSplitterTest {
         _assertEq(expectedFirst + expectedSecond, amount);
     }
 
+    function testFuzzAllocationIsIndependentOfBatching(
+        uint64 rawFirstAmount,
+        uint64 rawSecondAmount,
+        uint8 rawFirstShareUnits
+    ) public {
+        uint256 firstAmount = uint256(rawFirstAmount) + 1;
+        uint256 secondAmount = uint256(rawSecondAmount) + 1;
+        uint256 totalAmount = firstAmount + secondAmount;
+        uint8 firstShareUnits = uint8((uint256(rawFirstShareUnits) % 19) + 1);
+        uint8 secondShareUnits = 20 - firstShareUnits;
+        PonsV2TwoWayFeeSplitter batched =
+            _deploy(RECIPIENT_ONE, RECIPIENT_TWO, firstShareUnits, secondShareUnits, address(0), address(0));
+        PonsV2TwoWayFeeSplitter oneBatch =
+            _deploy(RECIPIENT_ONE, RECIPIENT_TWO, firstShareUnits, secondShareUnits, address(0), address(0));
+
+        VM.deal(address(this), totalAmount * 2);
+
+        _fundAndAllocate(batched, firstAmount);
+        _fundAndAllocate(batched, secondAmount);
+        _fundAndAllocate(oneBatch, totalAmount);
+
+        _assertEq(batched.pendingNative(RECIPIENT_ONE), oneBatch.pendingNative(RECIPIENT_ONE));
+        _assertEq(batched.pendingNative(RECIPIENT_TWO), oneBatch.pendingNative(RECIPIENT_TWO));
+        _assertEq(
+            batched.pendingToken(address(token), RECIPIENT_ONE), oneBatch.pendingToken(address(token), RECIPIENT_ONE)
+        );
+        _assertEq(
+            batched.pendingToken(address(token), RECIPIENT_TWO), oneBatch.pendingToken(address(token), RECIPIENT_TWO)
+        );
+        _assertEq(batched.nativeRecipientOneRemainder(), oneBatch.nativeRecipientOneRemainder());
+        _assertEq(
+            batched.tokenRecipientOneRemainder(address(token)), oneBatch.tokenRecipientOneRemainder(address(token))
+        );
+    }
+
     function testNativeReleaseFailureDoesNotBlockOtherRecipient() public {
         RejectNative rejector = new RejectNative();
         PonsV2TwoWayFeeSplitter rejecting =
-            _deploy(payable(address(rejector)), RECIPIENT_TWO, 5_000, address(0), address(0));
+            _deploy(payable(address(rejector)), RECIPIENT_TWO, 10, 10, address(0), address(0));
         (bool sent,) = address(rejecting).call{value: 10}("");
         require(sent, "native funding failed");
         rejecting.allocateNative();
@@ -201,7 +257,7 @@ contract PonsV2TwoWayFeeSplitterTest {
     function testNativeReleaseCannotBeReentered() public {
         ReentrantNativeRecipient attacker = new ReentrantNativeRecipient();
         PonsV2TwoWayFeeSplitter guarded =
-            _deploy(payable(address(attacker)), RECIPIENT_TWO, 5_000, address(0), address(0));
+            _deploy(payable(address(attacker)), RECIPIENT_TWO, 10, 10, address(0), address(0));
         attacker.setSplitter(guarded);
         (bool sent,) = address(guarded).call{value: 10}("");
         require(sent, "native funding failed");
@@ -236,23 +292,29 @@ contract PonsV2TwoWayFeeSplitterTest {
     }
 
     function testCreatorControlsCanBePermanentlyDisabled() public {
-        PonsV2TwoWayFeeSplitter ownerless = _deploy(RECIPIENT_ONE, RECIPIENT_TWO, 5_000, address(0), address(0));
+        PonsV2TwoWayFeeSplitter ownerless = _deploy(RECIPIENT_ONE, RECIPIENT_TWO, 10, 10, address(0), address(0));
         VM.expectRevert(PonsV2TwoWayFeeSplitter.NotController.selector);
         ownerless.transferCreatorFeeRecipient(LAUNCH_TOKEN, RECIPIENT_TWO);
     }
 
     function testRejectsInvalidConstructorTerms() public {
         VM.expectRevert(PonsV2TwoWayFeeSplitter.DuplicateRecipient.selector);
-        _deploy(RECIPIENT_ONE, RECIPIENT_ONE, 5_000, address(0), address(0));
+        _deploy(RECIPIENT_ONE, RECIPIENT_ONE, 10, 10, address(0), address(0));
 
-        VM.expectRevert(PonsV2TwoWayFeeSplitter.InvalidShare.selector);
-        _deploy(RECIPIENT_ONE, RECIPIENT_TWO, 0, address(0), address(0));
+        VM.expectRevert(PonsV2TwoWayFeeSplitter.InvalidShareUnits.selector);
+        _deploy(RECIPIENT_ONE, RECIPIENT_TWO, 0, 20, address(0), address(0));
 
-        VM.expectRevert(PonsV2TwoWayFeeSplitter.InvalidShare.selector);
-        _deploy(RECIPIENT_ONE, RECIPIENT_TWO, 10_000, address(0), address(0));
+        VM.expectRevert(PonsV2TwoWayFeeSplitter.InvalidShareUnits.selector);
+        _deploy(RECIPIENT_ONE, RECIPIENT_TWO, 20, 0, address(0), address(0));
+
+        VM.expectRevert(PonsV2TwoWayFeeSplitter.InvalidShareUnits.selector);
+        _deploy(RECIPIENT_ONE, RECIPIENT_TWO, 10, 9, address(0), address(0));
+
+        VM.expectRevert(PonsV2TwoWayFeeSplitter.InvalidShareUnits.selector);
+        _deploy(RECIPIENT_ONE, RECIPIENT_TWO, 10, 11, address(0), address(0));
 
         VM.expectRevert(PonsV2TwoWayFeeSplitter.InvalidControllerConfiguration.selector);
-        _deploy(RECIPIENT_ONE, RECIPIENT_TWO, 5_000, address(controls), address(0));
+        _deploy(RECIPIENT_ONE, RECIPIENT_TWO, 10, 10, address(controls), address(0));
     }
 
     function testUnknownRecipientCannotBeReleased() public {
@@ -263,7 +325,8 @@ contract PonsV2TwoWayFeeSplitterTest {
     function _deploy(
         address payable first,
         address payable second,
-        uint16 firstShareBps,
+        uint8 firstShareUnits,
+        uint8 secondShareUnits,
         address creatorControls,
         address controller
     ) private returns (PonsV2TwoWayFeeSplitter deployed) {
@@ -271,10 +334,20 @@ contract PonsV2TwoWayFeeSplitterTest {
             IPonsV2FeeEscrow(address(escrow)),
             first,
             second,
-            firstShareBps,
+            firstShareUnits,
+            secondShareUnits,
             IPonsV2CreatorControls(creatorControls),
             controller
         );
+    }
+
+    function _fundAndAllocate(PonsV2TwoWayFeeSplitter target, uint256 amount) private {
+        (bool sent,) = address(target).call{value: amount}("");
+        require(sent, "native funding failed");
+        target.allocateNative();
+
+        token.mint(address(target), amount);
+        target.allocateToken(token);
     }
 
     function _assertEq(uint256 actual, uint256 expected) private pure {

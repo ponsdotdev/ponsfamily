@@ -19,7 +19,8 @@ interface IPonsV2CreatorControls {
  * @title PonsV2TwoWayFeeSplitter
  * @author bananawalnut
  * @notice Optional creator-fee recipient that splits native ETH and ERC-20
- * proceeds between two immutable recipients at an immutable ratio.
+ * proceeds between two immutable recipients at an immutable ratio. Shares are
+ * expressed as whole units out of twenty, where each unit represents 5%.
  *
  * @dev Pons v2 records this contract as `creatorFeeRecipient`. Anyone may
  * claim its accrued balance from the pons fee escrow, allocate direct or
@@ -36,22 +37,27 @@ interface IPonsV2CreatorControls {
 contract PonsV2TwoWayFeeSplitter is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    uint16 public constant BASIS_POINTS = 10_000;
+    uint8 public constant SHARE_UNITS = 20;
+    uint8 public constant PERCENT_PER_SHARE_UNIT = 5;
 
     IPonsV2FeeEscrow public immutable feeEscrow;
     IPonsV2CreatorControls public immutable creatorControls;
     address public immutable controller;
     address payable public immutable recipientOne;
     address payable public immutable recipientTwo;
-    uint16 public immutable recipientOneShareBps;
-    uint16 public immutable recipientTwoShareBps;
+    uint8 public immutable recipientOneShareUnits;
+    uint8 public immutable recipientTwoShareUnits;
 
     mapping(address recipient => uint256 amount) public pendingNative;
     mapping(address token => mapping(address recipient => uint256 amount)) public pendingToken;
+    // Fractional numerators carried under SHARE_UNITS so allocation timing
+    // cannot change either recipient's cumulative entitlement.
+    uint256 public nativeRecipientOneRemainder;
+    mapping(address token => uint256 remainder) public tokenRecipientOneRemainder;
 
     error ZeroAddress();
     error DuplicateRecipient();
-    error InvalidShare();
+    error InvalidShareUnits();
     error InvalidControllerConfiguration();
     error NotController();
     error UnknownRecipient();
@@ -75,7 +81,8 @@ contract PonsV2TwoWayFeeSplitter is ReentrancyGuard {
         IPonsV2FeeEscrow feeEscrow_,
         address payable recipientOne_,
         address payable recipientTwo_,
-        uint16 recipientOneShareBps_,
+        uint8 recipientOneShareUnits_,
+        uint8 recipientTwoShareUnits_,
         IPonsV2CreatorControls creatorControls_,
         address controller_
     ) {
@@ -83,7 +90,10 @@ contract PonsV2TwoWayFeeSplitter is ReentrancyGuard {
             revert ZeroAddress();
         }
         if (recipientOne_ == recipientTwo_) revert DuplicateRecipient();
-        if (recipientOneShareBps_ == 0 || recipientOneShareBps_ >= BASIS_POINTS) revert InvalidShare();
+        if (
+            recipientOneShareUnits_ == 0 || recipientTwoShareUnits_ == 0
+                || uint16(recipientOneShareUnits_) + uint16(recipientTwoShareUnits_) != SHARE_UNITS
+        ) revert InvalidShareUnits();
 
         bool controlsDisabled = address(creatorControls_) == address(0) && controller_ == address(0);
         bool controlsEnabled = address(creatorControls_) != address(0) && controller_ != address(0);
@@ -92,8 +102,8 @@ contract PonsV2TwoWayFeeSplitter is ReentrancyGuard {
         feeEscrow = feeEscrow_;
         recipientOne = recipientOne_;
         recipientTwo = recipientTwo_;
-        recipientOneShareBps = recipientOneShareBps_;
-        recipientTwoShareBps = BASIS_POINTS - recipientOneShareBps_;
+        recipientOneShareUnits = recipientOneShareUnits_;
+        recipientTwoShareUnits = recipientTwoShareUnits_;
         creatorControls = creatorControls_;
         controller = controller_;
     }
@@ -193,7 +203,8 @@ contract PonsV2TwoWayFeeSplitter is ReentrancyGuard {
         amount = balance - accounted;
         if (amount == 0) return 0;
 
-        (uint256 firstAmount, uint256 secondAmount) = _split(amount);
+        (uint256 firstAmount, uint256 secondAmount, uint256 nextRemainder) = _split(amount, nativeRecipientOneRemainder);
+        nativeRecipientOneRemainder = nextRemainder;
         pendingNative[recipientOne] += firstAmount;
         pendingNative[recipientTwo] += secondAmount;
 
@@ -208,16 +219,29 @@ contract PonsV2TwoWayFeeSplitter is ReentrancyGuard {
         amount = balance - accounted;
         if (amount == 0) return 0;
 
-        (uint256 firstAmount, uint256 secondAmount) = _split(amount);
+        (uint256 firstAmount, uint256 secondAmount, uint256 nextRemainder) =
+            _split(amount, tokenRecipientOneRemainder[address(token)]);
+        tokenRecipientOneRemainder[address(token)] = nextRemainder;
         pendingToken[address(token)][recipientOne] += firstAmount;
         pendingToken[address(token)][recipientTwo] += secondAmount;
 
         emit TokenAllocated(address(token), amount, firstAmount, secondAmount);
     }
 
-    function _split(uint256 amount) private view returns (uint256 firstAmount, uint256 secondAmount) {
-        firstAmount = Math.mulDiv(amount, recipientOneShareBps, BASIS_POINTS);
-        // Assign the indivisible remainder to recipient two so no dust is trapped.
+    function _split(uint256 amount, uint256 previousRemainder)
+        private
+        view
+        returns (uint256 firstAmount, uint256 secondAmount, uint256 nextRemainder)
+    {
+        firstAmount = Math.mulDiv(amount, recipientOneShareUnits, SHARE_UNITS);
+
+        uint256 carriedRemainder = mulmod(amount, recipientOneShareUnits, SHARE_UNITS) + previousRemainder;
+        if (carriedRemainder >= SHARE_UNITS) {
+            firstAmount += 1;
+            carriedRemainder -= SHARE_UNITS;
+        }
+
+        nextRemainder = carriedRemainder;
         secondAmount = amount - firstAmount;
     }
 

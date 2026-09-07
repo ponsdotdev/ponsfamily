@@ -4,10 +4,14 @@
 want to divide pons v2 proceeds between two fixed wallets. It supports native
 ETH and every ERC-20 supported by the pons fee escrow.
 
-The recipients and ratio are immutable. Either recipient's accrued balance can
-be released independently, so a recipient that rejects ETH does not block the
-other recipient. The second recipient receives any indivisible rounding
-remainder, ensuring no split dust is trapped.
+The recipients and ratio are immutable. Each recipient's share is configured as
+an integer number of units, both shares must be non-zero and add to 20, and each
+unit represents 5%. The supported range is therefore 5%/95% through 95%/5%.
+Fractional remainders carry across allocations, so splitting funds into many
+small allocations produces the same result as allocating the total once.
+
+Either recipient's accrued balance can be released independently, so a
+recipient that rejects ETH does not block the other recipient.
 
 ## Deploy
 
@@ -19,7 +23,8 @@ PonsV2TwoWayFeeSplitter splitter = new PonsV2TwoWayFeeSplitter(
     feeEscrow,
     payable(recipientOne),
     payable(recipientTwo),
-    8_000,
+    16, // 80%
+    4,  // 20%
     IPonsV2CreatorControls(address(launchFactory)),
     controller
 );
@@ -33,7 +38,8 @@ PonsV2TwoWayFeeSplitter splitter = new PonsV2TwoWayFeeSplitter(
     feeEscrow,
     payable(recipientOne),
     payable(recipientTwo),
-    8_000,
+    16, // 80%
+    4,  // 20%
     IPonsV2CreatorControls(address(0)),
     address(0)
 );
