@@ -143,9 +143,14 @@ V2 replaces day-one concentrated liquidity with a fair-launch curve. Every launc
 | `PonsV2GraduationExecutor.sol` | Performs the heavy graduation steps: optional pairToken swap, Permit2 dance, full-range mint, dust sweep |
 | `PonsV2LaunchLocker.sol` | Permanently holds the graduated V4 position NFT; no `collectFees`, no withdrawal path |
 | `PonsV2BuybackVault.sol` | Shared vault holding bought-back supply on a five-year linear vest, split on recorded fee shares |
+| `PonsV2TwoWayFeeSplitter.sol` | Optional immutable two-recipient splitter for native and ERC-20 creator proceeds |
 | `hooks/PonsV2MemeHook.sol` | Singleton V4 hook: swap fee cut, internal memecoin→quote conversion, protocol/creator/buyback split |
 | `interfaces/ILaunchpadV2.sol`, `interfaces/ILaunchpadV2Graduation.sol` | Fee escrow, fee policy snapshot, factory/curve records and graduation hooks |
 | `libraries/PonsV2BondingCurveMath.sol`, `libraries/PonsV2GraduationMath.sol` | Curve pricing and graduation seed math |
+
+See [Two-way creator-fee splitter](contractsV2/examples/two-way-fee-splitter.md)
+for deployment, launch integration, claiming, and optional creator-control
+forwarding.
 
 **Guardrails baked into V2**
 
