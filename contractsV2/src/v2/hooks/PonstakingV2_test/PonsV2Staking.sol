@@ -808,4 +808,3 @@ contract PonsV2StakingBETA is Ownable2Step, ReentrancyGuard, Pausable {
         revert("PonsV2StakingBETA: invalid call");
     }
 }
-
