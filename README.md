@@ -243,7 +243,7 @@ Both generations vendor only the upstream files they actually compile against, k
 - `contractsV1/src/libraries/PonsTickMath.sol` keeps its `GPL-2.0-or-later` header from Uniswap V3 — keep it intact in forks.
 - This repository ships source only. Verify deployed bytecode against the verified sources and `contract-meta.json` before trusting a live address.
 
-If you find a security issue, please report it privately instead of opening a public issue. Contact details are on [ponsfamily.com](https://ponsfamily.com).
+If you find a security issue, report it privately. Do not open a public issue. See [SECURITY.md](SECURITY.md).
 
 ## Contributing
 
