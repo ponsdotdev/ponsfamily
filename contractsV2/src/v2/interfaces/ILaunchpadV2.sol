@@ -60,6 +60,12 @@ interface IPonsV2FeePolicy {
     function currentFeePolicy() external view returns (FeePolicySnapshot memory);
 }
 
+/// @notice Anti-snipe terms snapshotted by each curve when it initializes.
+interface IPonsV2SnipeTax {
+    function snipeTaxStartBps() external view returns (uint256);
+    function snipeTaxSeconds() external view returns (uint256);
+}
+
 /**
  * @notice Minimal ERC-721 receiver signature used by PonsV2LaunchLocker to
  * accept the graduated Uniswap V4 position NFT.

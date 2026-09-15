@@ -1,0 +1,28 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+allow_paths = ["../../sinjoh-contracts-unified-governance/sinjoh-contracts-v2"]
+remappings = [
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts-full/contracts/",
+    "@uniswap/v4-core/=lib/v4-core/",
+    "@uniswap/v4-hooks-public/=lib/v4-hooks-public/",
+    "@uniswap/v4-periphery/=lib/v4-periphery/",
+    "permit2/=lib/v4-periphery/lib/permit2/",
+    "forge-std/=lib/forge-std/src/",
+    "@sinjoh-v2/=../../sinjoh-contracts-unified-governance/sinjoh-contracts-v2/src/",
+]
+solc_version = "0.8.28"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+bytecode_hash = "none"
+cbor_metadata = false
+
+[fmt]
+line_length = 120
+tab_width = 4
+bracket_spacing = false
+int_types = "long"
+quote_style = "double"
